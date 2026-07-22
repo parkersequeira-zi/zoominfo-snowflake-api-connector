@@ -13,17 +13,25 @@ authorization code to). You'll paste the code it shows back into the app.
 
 ## 2. Create the network rule, secret, and integration (admin, once)
 
+> **POC responsibility split (DEV_PRODUCT / `ZI_API_NATIVE_APP`):** For the current
+> POC the **Snowflake team** pre-creates the `EXTERNAL_ACCESS_INTEGRATION_ZI_API`
+> object (along with the `ZI_API_NATIVE_APP` schema in the `DEV_PRODUCT` database and
+> a schema-scoped role granted to the developer). Using that granted role, the
+> **developer** creates `ZI_API_NETWORK_RULE` and `ZI_OAUTH_CLIENT_SECRET`, plus the
+> application package and the application itself. See the repo-root
+> `DEPLOY_PRIVILEGES_REQUEST.md` for the full division of responsibilities.
+
 Run this once in your account (as a role with the required privileges). Replace the placeholders.
 
 ```sql
--- Where the app is allowed to make outbound calls.
-CREATE OR REPLACE NETWORK RULE zoominfo_network_rule
+-- Where the app is allowed to make outbound calls. (developer creates)
+CREATE OR REPLACE NETWORK RULE ZI_API_NETWORK_RULE
   MODE = EGRESS
   TYPE = HOST_PORT
   VALUE_LIST = ('api.zoominfo.com');
 
--- Your ZoomInfo OAuth app config as a JSON string.
-CREATE OR REPLACE SECRET zoominfo_oauth_client
+-- Your ZoomInfo OAuth app config as a JSON string. (developer creates)
+CREATE OR REPLACE SECRET ZI_OAUTH_CLIENT_SECRET
   TYPE = GENERIC_STRING
   SECRET_STRING = '{
     "client_id": "YOUR_CLIENT_ID",
@@ -32,10 +40,10 @@ CREATE OR REPLACE SECRET zoominfo_oauth_client
     "scope": "your space delimited scopes"
   }';
 
--- Lets the app reach ZoomInfo, using the secret above.
-CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION zoominfo_access_integration
-  ALLOWED_NETWORK_RULES = (zoominfo_network_rule)
-  ALLOWED_AUTHENTICATION_SECRETS = (zoominfo_oauth_client)
+-- Lets the app reach ZoomInfo, using the secret above. (Snowflake team creates)
+CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION EXTERNAL_ACCESS_INTEGRATION_ZI_API
+  ALLOWED_NETWORK_RULES = (ZI_API_NETWORK_RULE)
+  ALLOWED_AUTHENTICATION_SECRETS = (ZI_OAUTH_CLIENT_SECRET)
   ENABLED = TRUE;
 ```
 
@@ -45,8 +53,8 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION zoominfo_access_integration
 ## 3. Bind them to the app
 
 Open the app → **Security / Configuration**, and bind:
-- **ZoomInfo OAuth client** → `zoominfo_oauth_client`
-- **ZoomInfo API external access** → `zoominfo_access_integration`
+- **ZoomInfo OAuth client** → `ZI_OAUTH_CLIENT_SECRET`
+- **ZoomInfo API external access** → `EXTERNAL_ACCESS_INTEGRATION_ZI_API`
 
 (Equivalent SQL: `ALTER APPLICATION <app> SET REFERENCE ...`.) Binding both references triggers the
 app to create the four API procedures and attach the integration to the sign-in page.

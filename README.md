@@ -57,6 +57,12 @@ Then create the objects the app needs (external access integration + OAuth clien
 references, and sign in — see [app/README.md](app/README.md) for the consumer setup plus `CALL`
 examples.
 
+For the current POC, deployment is split between the Snowflake team and the developer
+(who creates the `EXTERNAL_ACCESS_INTEGRATION_ZI_API` object, the `ZI_API_NETWORK_RULE`,
+the `ZI_OAUTH_CLIENT_SECRET`, the app package, and the app). See
+[DEPLOY_PRIVILEGES_REQUEST.md](DEPLOY_PRIVILEGES_REQUEST.md) for the full division of
+responsibilities and the grants required.
+
 ## Notes
 
 - The four data procedures are created lazily by the `register_reference` callback once **both** the

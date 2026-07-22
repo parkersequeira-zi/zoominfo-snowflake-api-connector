@@ -60,20 +60,24 @@ GRANT USAGE ON INTEGRATION EXTERNAL_ACCESS_INTEGRATION_ZI_API TO ROLE ZI_API_NAT
 GRANT ROLE ZI_API_NATIVE_APP_ROLE TO USER <USER>;
 ```
 
-`<USER>` already has a usable warehouse, so no warehouse grant is needed.
+`<USER>` needs USAGE on a warehouse to install the app (the setup script runs on
+compute). If the deploy role has no warehouse, grant it USAGE on an existing one
+(e.g. `GRANT USAGE ON WAREHOUSE <wh> TO ROLE ZI_API_NATIVE_APP_ROLE;`) or enable
+secondary roles so an existing grant applies.
 
 ## After the grants
 
 Using `ZI_API_NATIVE_APP_ROLE`, I will:
 1. Create `ZI_API_NETWORK_RULE` and `ZI_OAUTH_CLIENT_SECRET` in
-   `DEV_PRODUCT.ZI_API_NATIVE_APP`.
+   `DEV_PRODUCT.ZI_API_NATIVE_APP`. The secret holds the ZoomInfo API
+   `client_id`/`client_secret` (OAuth Client Credentials grant).
 2. `snow app run -c <connection> --role ZI_API_NATIVE_APP_ROLE` to build the
    application package and install the application.
 3. Bind the app's two references — `zoominfo_oauth_client` → `ZI_OAUTH_CLIENT_SECRET`
    and `zoominfo_external_access` → `EXTERNAL_ACCESS_INTEGRATION_ZI_API` — which
-   triggers creation of the 4 data procedures + 2 OAuth sign-in procedures.
-4. Open the app's "Connect ZoomInfo" page, sign in, and call the 4 procedures to
-   verify end-to-end before publishing.
+   triggers creation of the data, lookup, and usage procedures.
+4. Call the procedures (e.g. `CALL core.search_company(...)`) to verify end-to-end
+   before publishing.
 
 > `zoominfo_oauth_client` and `zoominfo_external_access` are the app's internal
 > reference (alias) names declared in `app/manifest.yml`; they are unrelated to the

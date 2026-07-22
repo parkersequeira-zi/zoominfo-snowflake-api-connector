@@ -1,40 +1,30 @@
 """
 ZoomInfo GTM API client for use inside a Snowflake Native App.
 
-Authentication uses ZoomInfo's OAuth 2.0 **Authorization Code flow with PKCE**,
-where an end user interactively signs in to their ZoomInfo account. Because a
-Snowflake stored procedure has no browser, the interactive step happens in the
-app's Streamlit "Connect ZoomInfo" page:
+Authentication uses ZoomInfo's OAuth 2.0 **Client Credentials** flow: one
+`client_id`/`client_secret` (supplied by the consumer, per ZoomInfo account) is
+exchanged directly for an access token — no interactive user sign-in, no PKCE.
+This mirrors ZoomInfo's own connector pattern (e.g. the Fivetran ZoomInfo
+connector). Each consumer binds THEIR OWN ZoomInfo API credentials, so calls are
+attributed to that consumer's ZoomInfo account (account-level, not per end user).
 
-  1. The app builds an authorize URL with a PKCE `code_challenge` (base64url
-     SHA256 of a locally generated `code_verifier`) and a `state` value, and the
-     user opens it, signs in, and authorizes.
-        GET https://api.zoominfo.com/gtm/oauth/v1/authorize
-  2. ZoomInfo returns an authorization `code` (pasted back into the app).
-  3. The app exchanges the code + `code_verifier` for tokens.
-        POST https://api.zoominfo.com/gtm/oauth/v1/token
-     Response: {access_token, expires_in, refresh_token, id_token, scope, ...}
+  POST https://api.zoominfo.com/gtm/oauth/v1/token
+    Authorization: Basic base64(client_id:client_secret)
+    Content-Type: application/x-www-form-urlencoded
+    body: grant_type=client_credentials
+  Response: {access_token, expires_in}   (no refresh token — just re-request)
 
-The four data procedures do NOT sign in. They read the caller's stored
-access token and call the GTM API; on 401/expiry they use the stored
-`refresh_token` to obtain a fresh access token. ZoomInfo **rotates** refresh
-tokens — each refresh returns a new refresh token and invalidates the old one —
-so callers must persist whatever this module returns.
-
-`requests` is available in the Snowflake Anaconda channel and declared in the
-procedure PACKAGES list. No private key / JWT signing is used anymore.
+The data procedures read a cached account token and call the GTM data API; on
+401/expiry they re-fetch the token. `requests` is available in the Snowflake
+Anaconda channel and declared in the procedure PACKAGES list.
 """
 
 import base64
-import hashlib
 import json
-import os
 import time
-from urllib.parse import urlencode
 
 import requests
 
-AUTHORIZE_URL = "https://api.zoominfo.com/gtm/oauth/v1/authorize"
 TOKEN_URL = "https://api.zoominfo.com/gtm/oauth/v1/token"
 GTM_BASE_URL = "https://api.zoominfo.com/gtm"
 
@@ -44,60 +34,50 @@ _REFRESH_SKEW_SECONDS = 60
 
 
 class ZoomInfoError(Exception):
-    """Raised when a ZoomInfo API call fails. Surfaces the HTTP status and body."""
+    """Raised when a ZoomInfo API call fails. Carries the HTTP status."""
 
     def __init__(self, status_code, message):
         self.status_code = status_code
         super().__init__(f"ZoomInfo API error {status_code}: {message}")
 
 
-# --------------------------------------------------------------------------- #
-# PKCE helpers
-# --------------------------------------------------------------------------- #
-
-def _b64url(raw):
-    """base64url-encode bytes without padding, as required by PKCE (RFC 7636)."""
-    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+# ZoomInfo error bodies are JSON:API `{"error":..., "error_description":...}` or
+# `{"errors":[...]}`. We surface a short, non-sensitive summary rather than the raw
+# body, so tokens / PII / internal detail never reach a Snowflake error message.
+_MAX_DETAIL = 300
 
 
-def make_code_verifier():
-    """Return a high-entropy, base64url code_verifier (43-128 chars per spec)."""
-    return _b64url(os.urandom(64))
+def _safe_error_detail(text):
+    """Extract a bounded, non-sensitive detail string from a response body.
 
-
-def make_state():
-    """Return an opaque anti-CSRF state value."""
-    return _b64url(os.urandom(24))
-
-
-def code_challenge(verifier):
-    """S256 challenge: base64url( SHA256( verifier ) )."""
-    digest = hashlib.sha256(verifier.encode("ascii")).digest()
-    return _b64url(digest)
-
-
-def build_authorize_url(cfg, state, verifier, scope=None):
-    """Build the ZoomInfo authorize URL the user opens to sign in.
-
-    `cfg` is the OAuth client config dict (client_id, redirect_uri, and an
-    optional default `scope`). `scope` overrides cfg's scope when provided.
+    Prefers the standard OAuth/JSON:API error fields; falls back to a truncated
+    snippet. Never returns access tokens or full bodies.
     """
-    params = {
-        "client_id": cfg["client_id"],
-        "redirect_uri": cfg["redirect_uri"],
-        "response_type": "code",
-        "code_challenge": code_challenge(verifier),
-        "code_challenge_method": "S256",
-        "state": state,
-    }
-    effective_scope = scope if scope is not None else cfg.get("scope")
-    if effective_scope:
-        params["scope"] = effective_scope
-    return f"{AUTHORIZE_URL}?{urlencode(params)}"
+    if not text:
+        return ""
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        return text[:_MAX_DETAIL]
+    if isinstance(obj, dict):
+        # OAuth-style
+        for k in ("error_description", "error", "message", "detail"):
+            v = obj.get(k)
+            if isinstance(v, str) and v:
+                return v[:_MAX_DETAIL]
+        # JSON:API errors array
+        errs = obj.get("errors")
+        if isinstance(errs, list) and errs:
+            first = errs[0]
+            if isinstance(first, dict):
+                v = first.get("detail") or first.get("title")
+                if isinstance(v, str) and v:
+                    return v[:_MAX_DETAIL]
+    return ""
 
 
 # --------------------------------------------------------------------------- #
-# Token endpoint (code exchange + refresh)
+# Token endpoint (Client Credentials)
 # --------------------------------------------------------------------------- #
 
 def _basic_auth_header(client_id, client_secret):
@@ -105,43 +85,35 @@ def _basic_auth_header(client_id, client_secret):
     return "Basic " + base64.b64encode(raw).decode("ascii")
 
 
-def _token_request(cfg, form):
-    """POST to the token endpoint with HTTP Basic client auth; return parsed JSON."""
+def get_access_token(cfg):
+    """Fetch a fresh account access token via the Client Credentials grant.
+
+    `cfg` must contain `client_id` and `client_secret`. Returns the parsed token
+    response dict: {access_token, expires_in, ...}.
+    """
     headers = {
         "Authorization": _basic_auth_header(cfg["client_id"], cfg["client_secret"]),
         "Content-Type": "application/x-www-form-urlencoded",
         "Accept": "application/json",
     }
-    resp = requests.post(TOKEN_URL, headers=headers, data=form, timeout=30)
+    resp = requests.post(
+        TOKEN_URL,
+        headers=headers,
+        data={"grant_type": "client_credentials"},
+        timeout=30,
+    )
     if not resp.ok:
-        raise ZoomInfoError(resp.status_code, resp.text)
+        # The token endpoint's body can reflect credential context — surface only
+        # a bounded, safe detail (e.g. the OAuth error_description).
+        raise ZoomInfoError(
+            resp.status_code,
+            f"authentication failed — check client_id/client_secret and that the "
+            f"client_credentials grant is enabled. {_safe_error_detail(resp.text)}".strip(),
+        )
     try:
         return json.loads(resp.text)
-    except ValueError as exc:
-        raise ZoomInfoError(resp.status_code, f"unexpected token response: {resp.text}") from exc
-
-
-def exchange_code(cfg, code, verifier):
-    """Exchange an authorization code + PKCE verifier for the initial token set."""
-    return _token_request(cfg, {
-        "grant_type": "authorization_code",
-        "code": code,
-        "code_verifier": verifier,
-        "redirect_uri": cfg["redirect_uri"],
-    })
-
-
-def refresh(cfg, refresh_token):
-    """Exchange a refresh token for a new token set.
-
-    ZoomInfo rotates refresh tokens: the response carries a NEW refresh_token
-    and the one passed in is invalidated. Callers must persist the returned
-    refresh_token.
-    """
-    return _token_request(cfg, {
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    })
+    except ValueError:
+        raise ZoomInfoError(resp.status_code, "unexpected (non-JSON) token response.")
 
 
 def token_expires_at(token_response, now=None):
@@ -162,8 +134,8 @@ class ZoomInfoClient:
 
     Constructed with a current `access_token` and a `token_refresher` callback.
     On a 401 the client invokes the refresher exactly once to obtain a fresh
-    access token, then retries the request. The refresher is responsible for
-    persisting rotated tokens; it must return the new access token string.
+    access token, then retries the request. The refresher must return the new
+    access token string (and is responsible for caching it).
     """
 
     def __init__(self, access_token, token_refresher=None, base_url=GTM_BASE_URL):
@@ -171,30 +143,42 @@ class ZoomInfoClient:
         self._refresher = token_refresher
         self._base_url = base_url.rstrip("/")
 
-    def _headers(self):
-        return {
+    def _headers(self, json_body=True):
+        # ZoomInfo's GTM endpoints are JSON:API — they require the
+        # application/vnd.api+json media type and return 406 for plain
+        # application/json. GET requests send Accept only (no Content-Type).
+        headers = {
             "Authorization": f"Bearer {self._access_token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "Accept": "application/vnd.api+json",
         }
+        if json_body:
+            headers["Content-Type"] = "application/vnd.api+json"
+        return headers
 
-    def post(self, path, body, params=None, max_retries=3):
-        """POST a JSON body to a GTM path.
+    def _request(self, method, path, body=None, params=None, max_retries=3):
+        """Issue a request, refreshing once on 401 and backing off on 429.
 
-        Retries with backoff on 429 (honoring Retry-After) and refreshes once on
-        401. Returns the parsed JSON response; raises ZoomInfoError otherwise.
+        Returns the parsed JSON response; raises ZoomInfoError otherwise.
         """
         url = f"{self._base_url}{path}"
         attempt = 0
         refreshed = False
         while True:
-            resp = requests.post(
-                url,
-                headers=self._headers(),
-                data=json.dumps(body),
-                params=params or {},
-                timeout=60,
-            )
+            if method == "POST":
+                resp = requests.post(
+                    url,
+                    headers=self._headers(json_body=True),
+                    data=json.dumps(body),
+                    params=params or {},
+                    timeout=60,
+                )
+            else:  # GET
+                resp = requests.get(
+                    url,
+                    headers=self._headers(json_body=False),
+                    params=params or {},
+                    timeout=60,
+                )
             if resp.status_code == 401 and self._refresher and not refreshed:
                 # Access token likely expired; refresh once and retry.
                 self._access_token = self._refresher()
@@ -207,7 +191,15 @@ class ZoomInfoClient:
                 attempt += 1
                 continue
             if not resp.ok:
-                raise ZoomInfoError(resp.status_code, resp.text)
+                raise ZoomInfoError(resp.status_code, _safe_error_detail(resp.text))
             if not resp.text:
                 return {}
             return json.loads(resp.text)
+
+    def post(self, path, body, params=None, max_retries=3):
+        """POST a JSON body to a GTM path (search / enrich endpoints)."""
+        return self._request("POST", path, body=body, params=params, max_retries=max_retries)
+
+    def get(self, path, params=None, max_retries=3):
+        """GET a GTM path (lookup / usage endpoints)."""
+        return self._request("GET", path, params=params, max_retries=max_retries)

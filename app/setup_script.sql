@@ -2,10 +2,10 @@
 -- ZoomInfo Connector — Native App setup script
 -- Runs each time the app is installed or upgraded. Must be idempotent.
 --
--- Auth model: OAuth 2.0 Authorization Code + PKCE. End users sign in to
--- ZoomInfo via the "Connect ZoomInfo" Streamlit page; their access/refresh
--- tokens are stored per Snowflake user in app_state.oauth_tokens. The four data
--- procedures read the caller's token and refresh it on expiry.
+-- Auth model: OAuth 2.0 Client Credentials. The consumer binds their own
+-- ZoomInfo API credentials (client_id/client_secret) as a SECRET; the app
+-- exchanges them for an account-level access token, caches it in
+-- app_state.token_cache, and calls ZoomInfo's data API. No per-user sign-in.
 -- =====================================================================
 
 CREATE APPLICATION ROLE IF NOT EXISTS app_public;
@@ -16,33 +16,31 @@ CREATE OR ALTER VERSIONED SCHEMA core;
 GRANT USAGE ON SCHEMA core TO APPLICATION ROLE app_public;
 
 -- ---------------------------------------------------------------------
--- Per-user OAuth token store
--- Rotating tokens are written by the app after login/refresh, so they live in
--- an app-owned table (not a read-only consumer secret). Keyed by Snowflake user
--- so each user has their own ZoomInfo connection.
+-- Account access-token cache
+-- The Client Credentials token is account-level (not per user), so a single
+-- cached row suffices. Written by the app after each token fetch.
 --
 -- STATEFUL data must NOT live in a versioned schema (each version gets its own
 -- copy, so data wouldn't persist across upgrades). Use a regular schema.
 -- ---------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS app_state;
 
-CREATE TABLE IF NOT EXISTS app_state.oauth_tokens (
-  sf_user       STRING NOT NULL PRIMARY KEY,
-  access_token  STRING,
-  refresh_token STRING,
-  expires_at    NUMBER,
-  updated_at    TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
+CREATE TABLE IF NOT EXISTS app_state.token_cache (
+  id           NUMBER NOT NULL PRIMARY KEY,   -- always 1 (single row)
+  access_token STRING,
+  expires_at   NUMBER,
+  updated_at   TIMESTAMP_LTZ DEFAULT CURRENT_TIMESTAMP()
 );
 
 -- Make the state schema visible to the app role. The app's own procedures reach
 -- the table via owner's rights regardless, but this exposes it for inspection.
 GRANT USAGE ON SCHEMA app_state TO APPLICATION ROLE app_public;
+
 -- ---------------------------------------------------------------------
 -- Reference-binding callbacks
 -- The consumer binds their SECRET and EXTERNAL ACCESS INTEGRATION to the
 -- references declared in manifest.yml. These callbacks drive the config UI
--- and record the binding. Names match register_callback/configuration_callback
--- in the manifest.
+-- and record the binding.
 -- ---------------------------------------------------------------------
 
 CREATE OR REPLACE PROCEDURE core.get_configuration(ref_name STRING)
@@ -77,7 +75,7 @@ $$;
 
 GRANT USAGE ON PROCEDURE core.get_configuration(STRING) TO APPLICATION ROLE app_public;
 
--- The four ZoomInfo API procedures read the consumer-bound OAuth client SECRET
+-- The four ZoomInfo API procedures read the consumer-bound API credentials SECRET
 -- and reach ZoomInfo through the consumer-bound EXTERNAL ACCESS INTEGRATION. A
 -- Python procedure's SECRETS/EAI bindings are validated at CREATE time, so these
 -- procedures CANNOT be created during install (the consumer has not bound the
@@ -90,7 +88,10 @@ CREATE OR REPLACE PROCEDURE core.create_api_procedures()
 AS
 $$
 BEGIN
-  CREATE OR REPLACE PROCEDURE core.enrich_contact(match_input VARIANT, output_fields ARRAY)
+  -- Inner "impl" procedures carry the EAI + SECRETS reference clauses. Consumers
+  -- cannot call reference-bearing procedures directly, so these are NOT granted
+  -- to app_public — the top-level SQL wrappers (created at install) call them.
+  CREATE OR REPLACE PROCEDURE core.enrich_contact_impl(match_input VARIANT, output_fields ARRAY)
     RETURNS VARIANT
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
@@ -99,9 +100,8 @@ BEGIN
     HANDLER = 'handlers.enrich_contact'
     EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
     SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
-  GRANT USAGE ON PROCEDURE core.enrich_contact(VARIANT, ARRAY) TO APPLICATION ROLE app_public;
 
-  CREATE OR REPLACE PROCEDURE core.enrich_company(match_input VARIANT, output_fields ARRAY)
+  CREATE OR REPLACE PROCEDURE core.enrich_company_impl(match_input VARIANT, output_fields ARRAY)
     RETURNS VARIANT
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
@@ -110,9 +110,8 @@ BEGIN
     HANDLER = 'handlers.enrich_company'
     EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
     SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
-  GRANT USAGE ON PROCEDURE core.enrich_company(VARIANT, ARRAY) TO APPLICATION ROLE app_public;
 
-  CREATE OR REPLACE PROCEDURE core.search_contact(criteria VARIANT, page_number INT, page_size INT)
+  CREATE OR REPLACE PROCEDURE core.search_contact_impl(criteria VARIANT, page_number INT, page_size INT)
     RETURNS VARIANT
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
@@ -121,9 +120,8 @@ BEGIN
     HANDLER = 'handlers.search_contact'
     EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
     SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
-  GRANT USAGE ON PROCEDURE core.search_contact(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
 
-  CREATE OR REPLACE PROCEDURE core.search_company(criteria VARIANT, page_number INT, page_size INT)
+  CREATE OR REPLACE PROCEDURE core.search_company_impl(criteria VARIANT, page_number INT, page_size INT)
     RETURNS VARIANT
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
@@ -132,51 +130,134 @@ BEGIN
     HANDLER = 'handlers.search_company'
     EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
     SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
-  GRANT USAGE ON PROCEDURE core.search_company(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
 
-  -- OAuth sign-in procedures. These hold the EAI + secret bindings so the
-  -- Streamlit "Connect ZoomInfo" page itself needs no external access — it just
-  -- calls these. begin_connect builds the PKCE authorize URL; connect_with_code
-  -- exchanges the pasted authorization code for tokens.
-  CREATE OR REPLACE PROCEDURE core.begin_connect()
+  CREATE OR REPLACE PROCEDURE core.lookup_search_impl(entity STRING, field_type STRING)
     RETURNS VARIANT
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
     PACKAGES = ('snowflake-snowpark-python', 'requests')
     IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py')
-    HANDLER = 'handlers.begin_connect'
+    HANDLER = 'handlers.lookup_search'
     EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
     SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
-  GRANT USAGE ON PROCEDURE core.begin_connect() TO APPLICATION ROLE app_public;
 
-  CREATE OR REPLACE PROCEDURE core.connect_with_code(code STRING, verifier STRING)
+  CREATE OR REPLACE PROCEDURE core.lookup_enrich_impl(entity STRING, field_type STRING)
     RETURNS VARIANT
     LANGUAGE PYTHON
     RUNTIME_VERSION = '3.11'
     PACKAGES = ('snowflake-snowpark-python', 'requests')
     IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py')
-    HANDLER = 'handlers.connect_with_code'
+    HANDLER = 'handlers.lookup_enrich'
     EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
     SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
-  GRANT USAGE ON PROCEDURE core.connect_with_code(STRING, STRING) TO APPLICATION ROLE app_public;
+
+  CREATE OR REPLACE PROCEDURE core.get_usage_impl()
+    RETURNS VARIANT
+    LANGUAGE PYTHON
+    RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py')
+    HANDLER = 'handlers.get_usage'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.test_connection_impl()
+    RETURNS VARIANT
+    LANGUAGE PYTHON
+    RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py')
+    HANDLER = 'handlers.test_connection'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  -- Additional GTM endpoints (scoops / news / intent search; scoops / technologies /
+  -- corporate-hierarchy enrich; intent-topics lookup).
+  CREATE OR REPLACE PROCEDURE core.search_scoops_impl(criteria VARIANT, page_number INT, page_size INT)
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.search_scoops'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.search_news_impl(criteria VARIANT, page_number INT, page_size INT)
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.search_news'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.search_intent_impl(criteria VARIANT, page_number INT, page_size INT)
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.search_intent'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.enrich_scoops_impl(company_id STRING)
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.enrich_scoops'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.enrich_technologies_impl(company_id STRING)
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.enrich_technologies'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.enrich_corporate_hierarchy_impl(match_input VARIANT, output_fields ARRAY)
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.enrich_corporate_hierarchy'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
+
+  CREATE OR REPLACE PROCEDURE core.lookup_intent_topics_impl()
+    RETURNS VARIANT LANGUAGE PYTHON RUNTIME_VERSION = '3.11'
+    PACKAGES = ('snowflake-snowpark-python', 'requests')
+    IMPORTS = ('/src/zoominfo_client.py', '/src/handlers.py') HANDLER = 'handlers.lookup_intent_topics'
+    EXTERNAL_ACCESS_INTEGRATIONS = (REFERENCE('zoominfo_external_access'))
+    SECRETS = ('zoominfo_oauth_client' = REFERENCE('zoominfo_oauth_client'));
 
   RETURN 'api procedures created';
 END;
 $$;
 
--- Create the API procedures only once BOTH references are bound. SYSTEM$GET_ALL_REFERENCES
--- returns a JSON array of the currently bound references; we require both by name. This is
--- order-independent: whichever reference is bound second triggers creation.
+-- Create the API procedures only once BOTH references are bound. Probes each
+-- reference with SYSTEM$GET_ALL_REFERENCES(<name>) (which throws when unbound),
+-- so binding either reference triggers this and creation happens when the
+-- second one lands. Order-independent.
 CREATE OR REPLACE PROCEDURE core.create_api_procedures_if_ready()
   RETURNS STRING
   LANGUAGE SQL
 AS
 $$
 DECLARE
-  bound STRING;
+  secret_ok BOOLEAN DEFAULT FALSE;
+  eai_ok BOOLEAN DEFAULT FALSE;
+  refs STRING;
 BEGIN
-  bound := SYSTEM$GET_ALL_REFERENCES();
-  IF (bound LIKE '%ZOOMINFO_OAUTH_CLIENT%' AND bound LIKE '%ZOOMINFO_EXTERNAL_ACCESS%') THEN
+  -- SYSTEM$GET_ALL_REFERENCES(<ref_name>) throws if that reference has no
+  -- association yet, so probe each inside its own handler and treat a throw as
+  -- "not bound". Both must be bound before the API procedures can be created
+  -- (their SECRETS/EAI clauses are validated against bound references at CREATE).
+  BEGIN
+    refs := SYSTEM$GET_ALL_REFERENCES('ZOOMINFO_OAUTH_CLIENT');
+    secret_ok := (refs IS NOT NULL AND refs <> '[]');
+  EXCEPTION
+    WHEN OTHER THEN secret_ok := FALSE;
+  END;
+  BEGIN
+    refs := SYSTEM$GET_ALL_REFERENCES('ZOOMINFO_EXTERNAL_ACCESS');
+    eai_ok := (refs IS NOT NULL AND refs <> '[]');
+  EXCEPTION
+    WHEN OTHER THEN eai_ok := FALSE;
+  END;
+
+  IF (secret_ok AND eai_ok) THEN
     CALL core.create_api_procedures();
     RETURN 'created';
   END IF;
@@ -209,17 +290,187 @@ $$;
 GRANT USAGE ON PROCEDURE core.register_reference(STRING, STRING, STRING) TO APPLICATION ROLE app_public;
 
 -- ---------------------------------------------------------------------
--- Streamlit "Connect ZoomInfo" page
--- Runs the interactive PKCE sign-in and writes tokens to app_state.oauth_tokens.
--- Created bare at install (no EAI/secret) so it exists for the manifest's
--- default_streamlit and the consumer can open the app. Its EAI + secret binding
--- is attached later by create_api_procedures() once both references are bound
--- (ALTER STREAMLIT), because those bindings are validated against a bound
--- reference. Warehouse references are not supported for Native App Streamlit, so
--- no QUERY_WAREHOUSE is set (the app uses the caller's warehouse).
+-- Public wrapper procedures (created at install; no reference clauses)
+-- Consumers cannot directly call the reference-bearing *_impl procedures, so
+-- these thin SQL wrappers — which the consumer CALLs — invoke the impls in the
+-- app's owner rights. The impls are created later by create_api_procedures()
+-- once both references are bound; these wrappers just need to exist and be
+-- granted. A wrapper called before the impl exists returns a clear error.
 -- ---------------------------------------------------------------------
-CREATE STREAMLIT IF NOT EXISTS core.connect_zoominfo
-  FROM '/src'
-  MAIN_FILE = 'streamlit_app.py';
+CREATE OR REPLACE PROCEDURE core.enrich_contact(match_input VARIANT, output_fields ARRAY)
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.enrich_contact_impl(:match_input, :output_fields) INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.enrich_contact(VARIANT, ARRAY) TO APPLICATION ROLE app_public;
 
-GRANT USAGE ON STREAMLIT core.connect_zoominfo TO APPLICATION ROLE app_public;
+CREATE OR REPLACE PROCEDURE core.enrich_company(match_input VARIANT, output_fields ARRAY)
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.enrich_company_impl(:match_input, :output_fields) INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.enrich_company(VARIANT, ARRAY) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.search_contact(criteria VARIANT, page_number INT, page_size INT)
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.search_contact_impl(:criteria, :page_number, :page_size) INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.search_contact(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.search_company(criteria VARIANT, page_number INT, page_size INT)
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.search_company_impl(:criteria, :page_number, :page_size) INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.search_company(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.lookup_search(entity STRING, field_type STRING)
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.lookup_search_impl(:entity, :field_type) INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.lookup_search(STRING, STRING) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.lookup_enrich(entity STRING, field_type STRING)
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.lookup_enrich_impl(:entity, :field_type) INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.lookup_enrich(STRING, STRING) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.get_usage()
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.get_usage_impl() INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.get_usage() TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.test_connection()
+  RETURNS VARIANT
+  LANGUAGE SQL
+AS
+$$
+DECLARE
+  result VARIANT;
+BEGIN
+  CALL core.test_connection_impl() INTO :result;
+  RETURN :result;
+END;
+$$;
+GRANT USAGE ON PROCEDURE core.test_connection() TO APPLICATION ROLE app_public;
+
+-- Additional GTM endpoint wrappers -------------------------------------------
+CREATE OR REPLACE PROCEDURE core.search_scoops(criteria VARIANT, page_number INT, page_size INT)
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.search_scoops_impl(:criteria, :page_number, :page_size) INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.search_scoops(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.search_news(criteria VARIANT, page_number INT, page_size INT)
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.search_news_impl(:criteria, :page_number, :page_size) INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.search_news(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.search_intent(criteria VARIANT, page_number INT, page_size INT)
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.search_intent_impl(:criteria, :page_number, :page_size) INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.search_intent(VARIANT, INT, INT) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.enrich_scoops(company_id STRING)
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.enrich_scoops_impl(:company_id) INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.enrich_scoops(STRING) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.enrich_technologies(company_id STRING)
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.enrich_technologies_impl(:company_id) INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.enrich_technologies(STRING) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.enrich_corporate_hierarchy(match_input VARIANT, output_fields ARRAY)
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.enrich_corporate_hierarchy_impl(:match_input, :output_fields) INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.enrich_corporate_hierarchy(VARIANT, ARRAY) TO APPLICATION ROLE app_public;
+
+CREATE OR REPLACE PROCEDURE core.lookup_intent_topics()
+  RETURNS VARIANT LANGUAGE SQL AS
+$$ DECLARE result VARIANT;
+BEGIN CALL core.lookup_intent_topics_impl() INTO :result; RETURN :result; END; $$;
+GRANT USAGE ON PROCEDURE core.lookup_intent_topics() TO APPLICATION ROLE app_public;
+
+-- ---------------------------------------------------------------------
+-- Flatten helper (table function)
+-- ZoomInfo returns records under data[] as {id, type, attributes:{...}}. The
+-- procedures return that whole VARIANT; this UDTF turns it into one row per
+-- record so results are query-friendly. Created at install (no references),
+-- so it's always available. Usage:
+--   SELECT f.* FROM TABLE(core.flatten_records(
+--     (CALL core.search_company(PARSE_JSON('{"companyName":"ZoomInfo"}'), 1, 25)))) f;
+-- (or pass any VARIANT you captured from a procedure result.)
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION core.flatten_records(response VARIANT)
+  RETURNS TABLE (id STRING, record_type STRING, attributes VARIANT, meta VARIANT)
+  AS
+$$
+  SELECT
+    value:id::STRING           AS id,
+    value:type::STRING         AS record_type,
+    value:attributes           AS attributes,
+    value:meta                 AS meta
+  FROM LATERAL FLATTEN(input => response:data)
+$$;
+GRANT USAGE ON FUNCTION core.flatten_records(VARIANT) TO APPLICATION ROLE app_public;

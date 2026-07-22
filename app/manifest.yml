@@ -1,25 +1,29 @@
 manifest_version: 1
 
+version:
+  name: v1_0
+  label: "1.0"
+  comment: "ZoomInfo connector — Client Credentials auth; contact/company search+enrich, lookup, usage."
+
 artifacts:
   setup_script: setup_script.sql
   readme: README.md
   extension_code: true
-  default_streamlit: core.connect_zoominfo
 
 configuration:
   log_level: info
-  trace_level: off
+  trace_level: on_event
 
 # References the consumer binds at install time. A Native App can only reach the
-# public internet through an EXTERNAL ACCESS INTEGRATION, and can only read the
-# ZoomInfo OAuth client credentials through a SECRET. Both are supplied by the
-# consumer and bound to these named references via the app's "Security"/config
-# screen (or with ALTER APPLICATION ... SET REFERENCE). The setup script wires
-# them into the procedures at CREATE time.
+# public internet through an EXTERNAL ACCESS INTEGRATION, and reads the consumer's
+# ZoomInfo API credentials through a SECRET. Both are supplied by the consumer and
+# bound to these named references via the app's "Security"/config screen (or with
+# ALTER APPLICATION ... SET REFERENCE). Auth is OAuth Client Credentials: the
+# consumer binds THEIR OWN ZoomInfo client_id/client_secret.
 references:
   - zoominfo_oauth_client:
-      label: "ZoomInfo OAuth client"
-      description: "Secret holding the ZoomInfo OAuth app config (client_id, client_secret, redirect_uri, scope) as JSON."
+      label: "ZoomInfo API credentials"
+      description: "Secret holding the consumer's ZoomInfo API client_id and client_secret (scope optional) as JSON."
       privileges:
         - READ
       object_type: SECRET

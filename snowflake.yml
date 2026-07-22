@@ -3,7 +3,7 @@ definition_version: 2
 entities:
   zoominfo_connector_pkg:
     type: application package
-    identifier: zoominfo_connector_pkg
+    identifier: ZI_API_CONNECTOR_PKG
     stage: stage_content.zoominfo_stage
     manifest: app/manifest.yml
     artifacts:
@@ -12,7 +12,7 @@ entities:
 
   zoominfo_connector_app:
     type: application
-    identifier: zoominfo_connector_app
+    identifier: ZI_API_CONNECTOR_APP
     from:
       target: zoominfo_connector_pkg
     debug: false

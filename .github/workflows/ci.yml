@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11"]   # matches the Native App procedure RUNTIME_VERSION
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Compile-check handler modules
+        run: |
+          python -c "import ast; ast.parse(open('app/src/zoominfo_client.py').read())"
+          python -c "import ast; ast.parse(open('app/src/handlers.py').read())"
+      - name: Run tests
+        run: pytest -q
